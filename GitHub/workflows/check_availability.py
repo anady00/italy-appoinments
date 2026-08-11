@@ -1,0 +1,52 @@
+name: Check Prenot@Mi Availability
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub may delay this under load; adjust as needed.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to commit the updated state.json back
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run availability check
+        env:
+          PRENOTAMI_USER: ${{ secrets.PRENOTAMI_USER }}
+          PRENOTAMI_PASS: ${{ secrets.PRENOTAMI_PASS }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          DEBUG: "1"   # temporarily on for troubleshooting -- remove/comment out once login works
+        run: python check_availability.py
+
+      - name: Upload debug artifacts (only if DEBUG was on and folder exists)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-output
+          path: debug/
+          if-no-files-found: ignore
+
+      - name: Commit updated state
+        run: |
+          git config user.name "prenotami-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "Update availability state [skip ci]"
+          git push
