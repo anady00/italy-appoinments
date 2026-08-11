@@ -1,266 +1,128 @@
-"""
-Prenot@Mi Availability Watcher
---------------------------------
-Logs into prenotami.esteri.it, checks every service listed on the account's
-/Services page for available appointment slots, and sends an email when a
-service that had NO availability now shows a green ("Disponibile") date.
-
-Environment variables required (set as GitHub Actions secrets):
-    PRENOTAMI_USER        - login email/username for prenotami.esteri.it
-    PRENOTAMI_PASS         - login password
-    GMAIL_USER              - the gmail address used to SEND the notification
-    GMAIL_APP_PASSWORD      - the 16-char Gmail App Password (NOT your normal password)
-    NOTIFY_EMAIL            - (optional) where to send alerts, defaults to GMAIL_USER
-
-Optional environment variables:
-    DEBUG=1  - saves screenshots + HTML of each page into ./debug/ for troubleshooting
-
-State is kept in state.json (committed back to the repo by the GitHub Action)
-so the script only emails you about *new* availability, not the same slot
-over and over.
-"""
-
-import os
-import re
-import json
-import sys
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime, timezone
-
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-BASE_URL = "https://prenotami.esteri.it"
-SERVICES_URL = f"{BASE_URL}/Services"
-STATE_FILE = "state.json"
-DEBUG = os.environ.get("DEBUG") == "1"
-
-PRENOTAMI_USER = os.environ["PRENOTAMI_USER"]
-PRENOTAMI_PASS = os.environ["PRENOTAMI_PASS"]
-GMAIL_USER = os.environ["GMAIL_USER"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", GMAIL_USER)
-
-
-def debug_dump(page, name):
-    if not DEBUG:
-        return
-    os.makedirs("debug", exist_ok=True)
-    try:
-        page.screenshot(path=f"debug/{name}.png", full_page=True)
-        with open(f"debug/{name}.html", "w", encoding="utf-8") as f:
-            f.write(page.content())
-    except Exception as e:
-        print(f"[debug] could not dump {name}: {e}")
-
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-def send_email(subject, body):
-    msg = MIMEMultipart()
-    msg["From"] = GMAIL_USER
-    msg["To"] = NOTIFY_EMAIL
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.send_message(msg)
-    print(f"[email] sent: {subject}")
-
-
-def login(page):
-    """Log into prenotami.esteri.it. This walks through the public login
-    form; if esteri.it changes their login page this is the part that will
-    need updating (run with DEBUG=1 and check debug/login.html)."""
-    page.goto(f"{BASE_URL}/Home", wait_until="domcontentloaded")
-    debug_dump(page, "01_home")
-
-    # Click "Effettuare il Login" which redirects to the OAuth (iam.esteri.it) page
-    page.click("text=Effettuare il Login")
-    page.wait_for_load_state("domcontentloaded")
-    debug_dump(page, "02_oauth_page")
-
-    # Try common selectors for the identity-provider login form.
-    user_selectors = ["input[type='email']", "input[name='username']", "#username", "input#Username"]
-    pass_selectors = ["input[type='password']", "input[name='password']", "#password", "input#Password"]
-
-    filled_user = False
-    for sel in user_selectors:
-        if page.locator(sel).count() > 0:
-            page.fill(sel, PRENOTAMI_USER)
-            filled_user = True
-            break
-    if not filled_user:
-        debug_dump(page, "02b_no_user_field")
-        raise RuntimeError(
-            "Could not find the username field on the login page. "
-            "Re-run with DEBUG=1, inspect debug/02_oauth_page.html and update user_selectors."
-        )
-
-    filled_pass = False
-    for sel in pass_selectors:
-        if page.locator(sel).count() > 0:
-            page.fill(sel, PRENOTAMI_PASS)
-            filled_pass = True
-            break
-    if not filled_pass:
-        debug_dump(page, "02c_no_pass_field")
-        raise RuntimeError(
-            "Could not find the password field on the login page. "
-            "Re-run with DEBUG=1, inspect debug/02_oauth_page.html and update pass_selectors."
-        )
-
-    # Submit
-    submit_selectors = ["button[type='submit']", "input[type='submit']", "text=Login", "text=Accedi"]
-    for sel in submit_selectors:
-        if page.locator(sel).count() > 0:
-            page.click(sel)
-            break
-
-    page.wait_for_load_state("networkidle", timeout=30000)
-    debug_dump(page, "03_after_login")
-
-    if "Services" not in page.url and page.locator("text=ahmed nady").count() == 0:
-        # Not a hard failure -- some accounts land elsewhere -- but flag it.
-        print(f"[login] warning: unexpected post-login URL: {page.url}")
-
-
-def get_service_links(page):
-    """Visit /Services and collect every 'BOOK' link on the table."""
-    page.goto(SERVICES_URL, wait_until="domcontentloaded")
-    page.wait_for_selector("table", timeout=20000)
-    debug_dump(page, "04_services_list")
-
-    links = page.eval_on_selector_all(
-        "table a[href*='/Services/Booking/'], table a:has-text('BOOK')",
-        "els => els.map(e => ({href: e.href, text: e.closest('tr') ? e.closest('tr').innerText : ''}))",
-    )
-
-    # Dedupe by href, keep first row text as a rough service name
-    seen = {}
-    for item in links:
-        href = item["href"]
-        if href not in seen:
-            # First line of the row text is usually the service type/name
-            name = item["text"].split("\n")[0:2]
-            seen[href] = " / ".join(name).strip()
-    return seen  # {url: label}
-
-
-def check_service_availability(page, url):
-    """Open a booking calendar page and look for green ('Disponibile') dates."""
-    page.goto(url, wait_until="domcontentloaded")
-    try:
-        page.wait_for_selector(".calendar, table.ui-datepicker-calendar, td", timeout=15000)
-    except PWTimeout:
-        pass
-    debug_dump(page, f"cal_{re.sub(r'[^A-Za-z0-9]+', '_', url)[-40:]}")
-
-    # Heuristic: look for calendar day cells that are marked available.
-    # Adjust these selectors after inspecting debug/*.html if they don't match.
-    available_cells = page.query_selector_all(
-        ".ui-datepicker-calendar td.available, "
-        "td.disponibile, "
-        "td[class*='available' i], "
-        "a.day.available"
-    )
-    if available_cells:
-        dates = []
-        for cell in available_cells:
-            txt = cell.inner_text().strip()
-            if txt:
-                dates.append(txt)
-        return True, dates
-
-    # Fallback: some pages render availability as green-background inline styles
-    green_cells = page.eval_on_selector_all(
-        "td, a, span",
-        """els => els
-            .filter(e => {
-                const bg = window.getComputedStyle(e).backgroundColor;
-                return bg === 'rgb(0, 128, 0)' || bg === 'rgb(40, 167, 69)' || bg.includes('green');
-            })
-            .map(e => e.innerText.trim())
-            .filter(t => t.length > 0 && t.length < 4)
-        """,
-    )
-    if green_cells:
-        return True, green_cells
-
-    # Also treat an explicit "no availability" text as a confirmed *not available*
-    return False, []
-
-
-def main():
-    state = load_state()
-    new_state = {}
-    newly_available = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-
-        try:
-            login(page)
-        except Exception as e:
-            print(f"[fatal] login failed: {e}")
-            browser.close()
-            sys.exit(1)
-
-        try:
-            services = get_service_links(page)
-        except Exception as e:
-            print(f"[fatal] could not read /Services page: {e}")
-            browser.close()
-            sys.exit(1)
-
-        print(f"[info] found {len(services)} bookable services")
-
-        for url, label in services.items():
-            try:
-                available, dates = check_service_availability(page, url)
-            except Exception as e:
-                print(f"[warn] failed to check {url}: {e}")
-                continue
-
-            new_state[url] = {"available": available, "dates": dates, "label": label}
-
-            was_available = state.get(url, {}).get("available", False)
-            if available and not was_available:
-                newly_available.append((label, url, dates))
-
-            status = "AVAILABLE" if available else "no slots"
-            print(f"[check] {label[:60]:60} -> {status}")
-
-        browser.close()
-
-    save_state(new_state)
-
-    if newly_available:
-        lines = []
-        for label, url, dates in newly_available:
-            date_str = ", ".join(dates) if dates else "(see page)"
-            lines.append(f"- {label}\n  {url}\n  dates: {date_str}")
-        body = (
-            f"في مواعيد جديدة متاحة على Prenot@Mi ({datetime.now(timezone.utc).isoformat()}):\n\n"
-            + "\n\n".join(lines)
-        )
-        send_email(f"🟢 Prenot@Mi: {len(newly_available)} خدمة فيها مواعيد جديدة", body)
-    else:
-        print("[info] no new availability this run")
-
-
-if __name__ == "__main__":
-    main()
+PK
+     ¸V
+]              prenotami-watcher/UT	 ;ÿzj;ÿzjux
+ ç  è  PK
+     ¸V
+]              prenotami-watcher/.github/UT	 ;ÿzj;ÿzjux
+ ç  è  PK
+     ¸V
+]            $  prenotami-watcher/.github/workflows/UT	 ;ÿzj;ÿzjux
+ ç  è  PK    ¸V
+]+ÜÀø  “  :  prenotami-watcher/.github/workflows/check-availability.ymlUT	 ;ÿzj;ÿzjux
+ ç  è  }UMoÚ@½ó+F¤‡$’¡6z	Mh©i4ªªªBk{Œ7Ø»îî,%ùï]Sb¬P!aæÍ›7_(Qá.
+L—01¨4]ÜJ­„,E"KI›^O«aÀ¦f®Dÿpãš
+Î¡’ÊÚ®%}q	Tb–üN…´àT†J-² ² g	„…˜a‡X¤†9 zÆáN›WŸMkm–y©×óLÚZPZáé%—H6Ú¹Xp|IÌ«œ(Ë
+äFWÌ0JIjeDÒë=èÄúÜS¯µaœ²‘gv‰Sä¢R°
+¦M%­õðÆ—Z*²CXIòhd i¶V'ái]q ,ñGü`µ‚D¤ËÆÖ»ˆ¨×òkG`°Ö[€³È\¢Ñp–n}.Vzø‰9a²¡B«p‹äê¨.«ó×ZR1Ü}cÝÁ#âÞzíÜ“÷ñ`Ðï2Þ(ÖV–Üæ¹½*•hwA¸ªCxnÇ”5È-"2,ò“+_Ë˜©íÉSÃÅ]ô
+ˆ|Š3YnwVºª›ÎÔ)­‘mz¼‹‹jÕ–8™Ž¿Ý}ÝÞÌïgãéÞ==ÅÔðHÅû6xyy7Íf‡pÞ¶»¾Ý|}ƒëõ÷·üG“Iˆõãnzõ®mßÇs"7ŸÎÇÞmÙ¶ìcŽàjüéþšû=è‡¯NùæaUk#ŒäÍ’yX:?õ~æÉh—”h
+­‰IJLI›Î 4ÕtdÞnR\oº}¼¯ý™à©JÜ„!™óøZ8Öªá9ÂšÏ G*ƒ\—þ¸à£´dOvÄ2çÁ/×bcOìƒ
+TÑ?¿U‡V¢É-$ñÖnob;7Æ³ÖÏ2”ŽrÉÅ‰rÍ'pr¡´Á®äËælìŒÃ›´`W>C¹\x9&ö1 _‡»-*%šúÿqÇŠËým
+.Ø\¸$æFwA"k_¯Ž1“yÎk™
+ÿ‡À¼Í|€žŸ·tAOTAÿ>hÚ_Ì~Ù%Ÿ„TþîòÖÎ½¿PK    ¸V
+]ÝxùQ   S    prenotami-watcher/README.mdUT	 ;ÿzj;ÿzjux
+ ç  è  WÝNG¾ß§™Û
+k M¤"UªÛP)$$z•5Î¶1¶ë]H‘P…±ÁŽ“›T}
+¥†Æ58ò$³·y’~çÌìùQjìzfÎÏwÎùÎ™	Q¨Û•ª÷ý‚#òE§\\vÊŽ·)ž½Òª]7y4å0èÊé
+y€‡<ZB^­à}y*{ø¾)‚FÐ5W\sLÛõìºc:ž|'‚nÐÀÎ"hÒÑ^Ð’Çrìâ¤Ï¯xôñÒ—‡‘à|äÐ°rKv}Ã)Ù®E’:lÊ…ô±«)ä ˆÞÅoK°©jAâlÁB B/Èf! Œ?	ei~"÷Ž…Ü‡QŸä0—ºç¸µjÅv*cÆÄ„ÀÒKSöâØQÐÆ±ZÓÁšvÉ=F+èD*C—æïþú²Á
+òB;Žß†’; ›PÐ†i
+ø—^=/&¢bÖ6­[ÂªÛ¿­;u{Í®x®éýîY·Ë\q¼ÕõåÜëjýÕËrõµ›ãã“cÇ7×ÊV@Ef³ð«‡¸¤
+ug£èÙ™lV|Ùþ
+ËÌÛSÇYh$ƒM;x	yŽ-m9$l[Ø40*3@…`z/OÄüùZMŠ®
+3_Ó¦ ‚÷ mfrÉ³kâg¤ÌK§TôœjeV¬z^ÍÍåÖ6‹¥Ru½â™+ÕêJÙ6KÕµœk—ÖëðÊ˜1cì“ò¿r¾X«ÕôN×¸Í2ú0ç\…¥‰`ÂáPàaOLß¥”GüDûx>
+Úµm±d—ê¶Ge°#Ï(Uj‡`ê $.¹¯ò²©Àõé_ÐÍ(¸n®OT*Jo(ÑÕG{qàŒ%ÛóœÊŠ+¾ìým+V^ˆbÝ).—mµ’/êù‘ýZÔíZÕu¼j}S¸|hÖ0¶ÈóÓ`w\©ÐŸ-õõ•ÂûõÏ–±5yÃçÆ…ëöÂ.«°8÷èñ“üÂƒçO—æ­Ø¤¨êsøÓ‘'rHXž"Ùº!¿KuˆÆX)62)½_ZJH?`@:ÈçAÄoWD\u[Xó
+ù Çl½l¯²íhì?È‰vÈkœgÈ)E3¨<T ^¯¨É
+lø³Ç‹÷¬8R‰ÄÝŽ“5Ò£êrÛ‰¬RÜv(fb@æÁO¿<Ÿ#UVÂ•4À8Æñ®¢ÍŒðáªCp¥Gü¨ã£&Â®Ñ½âUK
+|„;ffoÐÎ=
+«¸F¾Æ‘üÌœÁ2’í‰È–DðŠRãøï2/i»9¶ÃŒ1I,Ý‘ý¨Ûp•’p¢®PáÕÂ›ZÄˆluÁ­löG¢Ýºj6Kça¢<ÅÎÅõJ$ºÒ”Æ,6tƒÍ$M a³ FòH¤VW\ð8XÛ”;­°zËÕ§"€ëœ# ¨%¶ä¾ad³ñø¾D´fa¾n‰ÿßI”QÐ‰$‘¹CÚš 6Ct‰ÐŸÉ¡aÝ›ûáéü¬HM§¨‰EÆÄ8jB¤=Tèˆ$¤YÑö¸a²†T¾î9/‹%ÏM)JÛ¿á‚ÇìŠ»Z%íÜ²ðÐcÅ|Á:*Oå!£ÜÓG›×ù9Ô6Q§Žz%œ?ÇÖ3š$Ny¸ùÛ`Ù}ØC²Ó®]¶K _Š§Ö€×…ÅñHg,fŸKiæè(žž"/Öê¦{'£±<Ç»
+S}€1>- »4àQÚ_ÅøÖwúô€"¦ïPSSØQCþ	ÆÁaX3;h+ÊQÎa•êÕJè£Š$æ«ñJå‰C«&^ bÔ¹¯ÑºnŠd5–ëaˆ1uI‹J@e
+5Ã&ø*FÏÀPWçH¤_¥»HT§F¡ 1µ`åá^8rÞR¶„y‹Ô 4¦†¯Íä¤ó#‹(yñ·AîŽÍª)ƒC‘¢%âéä’à©ãú¸A=‹¸O¬Lô}|wVK›Œ0À*˜ûÈê}N=ÔÿØœ'.Ïy>8ÁÚ(&DÕgTžª¯ÕxM#z¬!t«I‡oÚ†t@AS+ŒÒC(oùrÀÙEÕÏ­0Ÿ÷±CS¹a3T;Zñ‘
+	;ÇE¨ùø²¾Ò À¦`°¸ÄÅÌÔÔT2Åq³ÅˆF]Õdà
+±rèÇÜ3s5û½¦vþßÞ
+3ŸfŽå[NÞ7‚cjíÑáÉèÑ'ž”ïÈœ.e±2ip¥!†p<N[-jñu…M6õ
+nkl1tp{FÏÂ2Ž¯§}äéÌÔäíq°PÏ7F¹°¾\vJ¨;Ê=t ‹ãëCò'¨
+o#*Èk†ûw¸ÉïÎªDñIÆÃîŸï‰‡ub×¿Ä…£Ó>Ñ_ÙJRžŠ¯…è$¥2îäÄ	ÑŠî}eÛÊY/âË¡¥
+¼Ã¸$«¡\Ñ—ÉŒM6#qÃÍtÔÌBv½áK2hŸB@e¾'P0Â[“ê«ßM[É6Õ
+Kt[pÓÓ¹s!ÆºFcâ²·60Ú0BˆÏÕ‘ôJ²©öv¸.ýšÆPK    ¸V
+]%‹_rç
+  í$  '  prenotami-watcher/check_availability.pyUT	 ;ÿzj;ÿzjux
+ ç  è  ½ÛnÜÆõ}¿b@YÒÙ¥dÇq“M7íÚ–/¨d	–œ U¶Ä,9»;Éaf†Zo=hÐ6? /A‹¶yîŸÈÑOè93^V+ÇE‚°½œ9sî·9´çy½#Ér¡}ÀÉäœò”ÎxÊõš|Nu¼d²7ü‘§·/Šð\
+RL4ã!SšIr= €$>S„3¹&ŠÉs3’r HˆÈ‰^2BãX”¹î«ÞÎ±P¤ 
+FæBj™J¬(ÐÉX®‰J…VBópæ‰‚_„e IVK–Ús”ô’j²¤	y~èPYùr±"j)Vp”,$ƒC¾÷ˆ«Bä ˜„jöz{ù9—"7dÏ©äÈ‹"’}Yr	2øŠiByÂõÓrF&±æ"WÀU,™VÁ¨Gà9z±÷üðdrð,zy¼÷‚TÏ¤bÁ+ÆwJ`9§™•z‹*7MŽÉ&¦‚*µ21°O&Ïö;0*}a´E“D2¥O˜ðxïù#³
+ÔùœÇ¥ia›ÊŸ¾xÔÆvçþ0^RIž¬“¢ G+Ä †ÉZ”pÊŒ¦5“Á
+»Ïÿ6ÚCô].}Q ušhTÉ?46¡)“hý„Íi™j…°½ÞauŽ°m¦³y´÷àå“ñ¤£è9TÅèà€ï}òôä`Ÿˆ9a4^Z_4î$lV.vŒ´%"\
+ÐU¾èõŽ5xáŠœ±BÃ¢p!|¥ÀÏýXd×èõ3Ÿ!Ë¨7É
+Afkó»ãAAOYà‹6‘§kë(
+•IèL”šÜÎÙêvÇ¯ h9{}	ã¤' öL¨à°çAÐ÷xV	h•û%™û…üºßj]¨L)ŸõæRd–“0ã
+5{
+ÂZ˜ƒg {'ð~
+(;ñ‚Êä[´ào€ˆ{üû+‘³ž,Rº^I¾XêP­ó8¢'5¿ðÞìÈ	MíI‰¹D‘£Ï«•^ïÁäx/zùbŸŒ‰·ÔºP£-qçõÀ©>{öpï¸ž{îèe° êdr²=~¶¿‡Ó{=ãk°(TXyd¸`Ò
+®C¢ü°ÉF–h8õº›Þ´·‘
+n‚ÆM€n%ƒ.d³QCu‚|t NuBøº˜ímoÐŠÔ ×ëASQRf…¡.®[eN>7mTeWðÔZJ›—€ZFÏXÂ¥ò=ƒ	h°×P`"q6>‘%³yFËusÉ„MÄY½Ïíñ
+$9bš—i!x
+>+®—D,÷7Ž-u–Â9o…lä±H 5Œ½RÏ‡©Áç
+øÌCpUÍŒäa,r
+ÉÊ,!ö:ÆL²gþ¤€ÇYK
+	I	èŸ¦ªhšu¡.‰ehD.Ø¥çT
+šDÆ7ýFÁ BT@h´¦üÆ‘ƒÑy›íwÐÚÊd•Éûs+\µ~qY±†i¸bÍü]ßNøÔkH·2Á˜xF•’ETÅœÓTÁ2ÏPúø®S™È$/_•³W,†<2Éºâ(S
+ðòNó·sê=†åM¢U’êÍa¶Ú!Ñl[b¢"ì6Cª5”"ß%Xù5@ªã9º[¥ ÑY•¯Ããƒ“£èøxß÷p%4u-ƒS÷îht†Í“âì{hz
+¿c°¥	6åeÐS€?ûÀ¹¨]Õ¨uŠ*Öà™•”mÿD’
+•²¡XAƒyc’“%ÜM¡ÇÔK¨È‹¥©~”f[|Tììôöú,´¦4_0<Ç¸¬;¨6€“+‹‹–é"W<M
+ªœA/
+¨Oà|Ä—en5îz
+,µ¦íµ™mÇ`6‰!±øÖh!´ð;åä©ÈfE¹Ž %æéØKDV¥Œ–xV£×’¦·{'ZâqÐ%Ü"AgÄÛ›Ï™Ö%…
+z³}dÆƒŽŠCg#1o‚”ëG'%âsš5:³
+×1¢õ=¬ûãm¸ƒÔÈšZyçèn$(ðcòo#Ö	\$°›‚|¨X
+Ü
+©lCpeèƒ†…çðâìŠæ
+ì³£æà˜œz</J}ª×÷ƒö§Sv³è¸ïºs»sË½Ö`·^º•i%¾Ro¡âzàë„º;·ÜkCÈ5Ö@È:6¸%K"äÈ˜”æõƒ}hWä&Î!Œ™R¾p•5w1? Ÿ’Ýn"7 H
+áwš Úå	+gg{&=k—÷|Cs›CÌ¢\°hÎYê\Ç”Ê#/0h2fÚ=¿CÓ{XWÇ9$|ã,Í•
+‘¹ëh“Bâuq¼`ÃÍhÇò¡
+Ðlì§5AoòIlÃaƒ>è­~“1»žõ³ûVcV<½³1þíÆŒÑ˜FœŸÃ˜.RþÆìZâº1o¨èYusWæçFJ˜•ZC[ms‚…hg„ëë&éÚ4ëÞ&qY¼J;-?Ù$ø“<Åæ|ÜbûÉ÷9Ó`—3ž¤˜.µ½~?Ø…çÆÌÿADçP~¢´ª(Î¿¼ú¾eŒïL[Jk˜ŽXV=t™AµÎi²ö!áÆÕ’òy¸(YRôHÿÐ!’á(¨¦n8¥HŠ¤FÀ>XÌS
+Ý‰¯7å†õ)”r™C›0"eÎ^£k7…Pzh=ª>ôANˆ¦‚›STÍ°¢”çgj£)úŒ+è`šy™é9DŠ¶®fmý ‡‡¿é<ì‚Aã dK
+Ò¾à¾SóÑ5¶s1Ð8hùî[|ÏI¨":3q!<vNÓHä5ˆBÊª•m	zº”l~{Ü¯õ±ó@ˆ3PûN: ÐhIÕ}Â·ª	¼AƒKÆŸ¢}á:Yø_ü
+D;"ùð/à³ø§BAwä÷µì äW›+!Ïs&±K'#Òï_ŽP±¤,Î},â3Æ
+H[Ri"ÅÊÐÁ¶œÛÏºY&–*›Kp\9Æ«“‹y¸Af
+Fwg#z ÄÝS_ª4QE“Ù®âqvÿylXœgaf^åØã83,ÁvvU[!cíÔ|ºÇÔXÇ÷¦¡‚Ë‰ö½/ ºOwGw§ÈŒ±)^…<²C¼ð•€‹„JK^ø[¤Ñp|A4‚P±ÔÝ+M'^ÇR{VV9"iâê°Àñ1\÷Œû˜¦pŸ¡ÒÞ
+0ÈRØ1*¯†ÆýÖÐ¸o‡ÆjKˆ‘wŠ¬ëcŠ-a:¶*ßK>DÂ$i&‡­Ý¤Œw>¬ƒ±,ÔÃ°6I¥¶ÇëÜ¼Ñ…d!T_öO?þŽ¿Ú~<}¿? ý¨ouy:¼·;š^6
+ûSVJˆoíÕŠM(tó,M•½dáM"£ò²d=ù+<“äU©ÌpS±Vëo*…+Üh4[»oÛzÍã®I"ò¾Ô:^Z|5úÈ’¯Î—%$Ï›ÒÍ
+Š=‡5ºA«Ïð`#iüccë4NAÛ¶ê³}Â§ ‚~Ü^•GªøÝ¡Õm¡b‡Ñ„•Q:@a¬ßxÎx D÷Ø€ÚD™”ÙºVðîùš~H
+¦Ä ˆVggã»Ès^ÍnŠ£ñ‘­»hüÌ’ã®óå2£‰½!B/ EBTòÜd)¥×)³þk@º¦ý±Z’UÐ¼]¼VmèŠí3xž­×t Ñ
+Î:ÃYÑ
+zT±ÂièC‘AcÇ’cdÔ‡\ÖÈðP¤B~r
+M¥0Ä]K_.fþî€Ü¹ûÑ€ì}òõ×­{¸wÿrÿc·	VŒÓ2aÊïôƒ.‘Ë®I›òÇšB‚í37•Ü”_#°!ÐICÿHÞ{¯yÿ%¹´•9èºpËL›ãÝÊIZÎU&)~ÞS›ï~¯¡”ÄÐ
+y¹èxŠ×ª¤`
+(°Ø
+ÞÆ‚WGÀív©æ5¶tdjNUL3
+¶lOP«iÐ*r›UE†¥t5_.M ¶&sÝ¾™Áø3¨²öæ\„ñRŠŒ—Y˜Ò2—þ’Qè£•ÚG›Rb·:"[Õj+hM;p„K~•«ñéT |Z3¹zýG&Ó†”k„çTÓtêæ0 –¸¡tÞ1nz©<£Ö
+§ÓÚ¿ó6F]7	ÞÐ>ÿþ›é:8^BºŸªjŠ<Ÿ‹)dlÌlG¾“,¸4‰q*·æµ0`’7†é€l[g¡Bl¾”läúMâÓªd®Ž¼SÕAô
+îˆŒ×¤iå8Œ´óSlç.·étbž—¬×Ù©ÃñÎbûxá5åsÔÎ3ÒÁšùÞÒ¼¦}l£]QÕ	hû}¿o}_\öcWCk`ÓÉµ‚Ùú
+¹õ§îë:ÚÈ&®¬ú†Íµ·!º<#%šÏ›|6y¶?y°¿çu9Àë¬I›æÿSxÛýß˜b
+ŽˆôNG÷w§ðç’¡èY
+—mÜôz›<›o;µ}šKý†€°¦oic®	ŽŽ~#|
+¨bJÅ¹‰½LX!‰UÄšm>‚®:/N÷soXéãò
+¸w7Åø«£×v[übô»ƒ¬¹÷æo¾%o¾yóç«ï¯þýæÛ«ÈÕ?®~ÀWƒõ«¿Ãú?á'lþñÍ_Hó¿uü
+÷<ÌÅÊwßÈÃRÇpU'Þrÿe0ú"‡kV‡îûÄ3‹VF¶†Óö7úKØÜûÏwßýµ¡?²™iCí ®þìƒÌƒdoþtõýMÒyÕW5{#åo~Ùt‰üÈt›@ó‰F–f6ÔFÞ
+£È|L"¬ÜQäUìLïýPK
+     ¸V
+]©œö?      "  prenotami-watcher/requirements.txtUT	 ;ÿzj;ÿzjux
+ ç  è  playwright==1.47.0
+PK
+     ¸V
+]                     íA    prenotami-watcher/UT ;ÿzjux
+ ç  è  PK
+     ¸V
+]                     íAL   prenotami-watcher/.github/UT ;ÿzjux
+ ç  è  PK
+     ¸V
+]            $         íA    prenotami-watcher/.github/workflows/UT ;ÿzjux
+ ç  è  PK    ¸V
+]+ÜÀø  “  :         ¤þ   prenotami-watcher/.github/workflows/check-availability.ymlUT ;ÿzjux
+ ç  è  PK    ¸V
+]ÝxùQ   S           ¤j  prenotami-watcher/README.mdUT ;ÿzjux
+ ç  è  PK    ¸V
+]%‹_rç
+  í$  '         ¤  prenotami-watcher/check_availability.pyUT ;ÿzjux
+ ç  è  PK
+     ¸V
+]©œö?      "         ¤X  prenotami-watcher/requirements.txtUT ;ÿzjux
+ ç  è  PK        Ø  Ç    
